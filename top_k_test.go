@@ -235,3 +235,26 @@ func BenchmarkTopKValues10kX1M(b *testing.B) {
 		topk.Values()
 	}
 }
+
+func BenchmarkTopKMultithreadedInsert(b *testing.B) {
+	b.StopTimer()
+	topk := NewTopK(100, 0.00001, 0.999)
+	b.StartTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			topk.Insert([]byte(strconv.FormatUint(rand.Uint64(), 10)), 1)
+		}
+	})
+}
+
+func BenchmarkTopKMultithreadedInsertAndValues(b *testing.B) {
+	b.StopTimer()
+	topk := NewTopK(100, 0.00001, 0.999)
+	b.StartTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			topk.Insert([]byte(strconv.FormatUint(rand.Uint64(), 10)), 1)
+			topk.Values()
+		}
+	})
+}
