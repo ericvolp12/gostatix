@@ -17,6 +17,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 )
 
 type heapElement struct {
@@ -24,35 +25,38 @@ type heapElement struct {
 	frequency uint64
 }
 
-type minHeap []heapElement
-
-func (h minHeap) Len() int {
-	return len(h)
+type minHeap struct {
+	h  []heapElement
+	lk sync.Mutex
 }
 
-func (h minHeap) Less(i, j int) bool {
-	return h[i].frequency < h[j].frequency
+func (h *minHeap) Len() int {
+	return len(h.h)
 }
 
-func (h minHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
+func (h *minHeap) Less(i, j int) bool {
+	return h.h[i].frequency < h.h[j].frequency
+}
+
+func (h *minHeap) Swap(i, j int) {
+	h.h[i], h.h[j] = h.h[j], h.h[i]
 }
 
 func (h *minHeap) Push(x any) {
-	*h = append(*h, x.(heapElement))
+	h.h = append(h.h, x.(heapElement))
 }
 
 func (h *minHeap) Pop() any {
-	old := *h
+	old := h.h
 	n := len(old)
 	x := old[n-1]
-	*h = old[0 : n-1]
+	h.h = old[0 : n-1]
 	return x
 }
 
-func (h minHeap) IndexOf(element string) int {
-	for i := range h {
-		if h[i].value == element {
+func (h *minHeap) IndexOf(element string) int {
+	for i := range h.h {
+		if h.h[i].value == element {
 			return i
 		}
 	}
@@ -70,7 +74,7 @@ type TopK struct {
 	errorRate float64
 	accuracy  float64
 	sketch    *CountMinSketch
-	heap      minHeap
+	heap      *minHeap
 }
 
 // TopKElement is the struct used to return the results of the TopK
@@ -85,8 +89,10 @@ type TopKElement struct {
 // _accuracy_ is the delta in the error rate
 func NewTopK(k uint, errorRate, accuracy float64) *TopK {
 	sketch, _ := NewCountMinSketchFromEstimates(errorRate, accuracy)
-	heap := &minHeap{}
-	return &TopK{k, errorRate, accuracy, sketch, *heap}
+	heap := minHeap{
+		h: make([]heapElement, 0),
+	}
+	return &TopK{k, errorRate, accuracy, sketch, &heap}
 }
 
 // Insert puts the _data_ (byte slice) in the TopK data structure with _count_
@@ -100,23 +106,29 @@ func (t *TopK) Insert(data []byte, count uint64) {
 	sketch := t.sketch
 	sketch.Update(data, count)
 	frequency := sketch.Count(data)
-	if uint(len(t.heap)) < t.k || frequency >= t.heap[0].frequency {
+
+	t.heap.lk.Lock()
+	defer t.heap.lk.Unlock()
+	if uint(len(t.heap.h)) < t.k || frequency >= t.heap.h[0].frequency {
 		index := t.heap.IndexOf(element)
 		if index > -1 {
-			heap.Remove(&t.heap, index)
+			heap.Remove(t.heap, index)
 		}
-		heap.Push(&t.heap, heapElement{element, frequency})
-		if uint(len(t.heap)) > t.k {
-			heap.Pop(&t.heap)
+		heap.Push(t.heap, heapElement{element, frequency})
+		if uint(len(t.heap.h)) > t.k {
+			heap.Pop(t.heap)
 		}
 	}
 }
 
 // Values returns the top _k_ elements in the TopK data structure
 func (t *TopK) Values() []TopKElement {
+	t.heap.lk.Lock()
+	defer t.heap.lk.Unlock()
+
 	var results []TopKElement
-	for i := len(t.heap) - 1; i >= 0; i-- {
-		results = append(results, TopKElement{t.heap[i].value, t.heap[i].frequency})
+	for i := len(t.heap.h) - 1; i >= 0; i-- {
+		results = append(results, TopKElement{t.heap.h[i].value, t.heap.h[i].frequency})
 	}
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Count == results[j].Count {
@@ -157,8 +169,8 @@ func (t *TopK) Export() ([]byte, error) {
 	sketch.Rows = t.sketch.rows
 	sketch.Matrix = t.sketch.matrix
 	var heap []heapElementJSON
-	for i := range t.heap {
-		heap = append(heap, heapElementJSON{Value: t.heap[i].value, Frequency: t.heap[i].frequency})
+	for i := range t.heap.h {
+		heap = append(heap, heapElementJSON{Value: t.heap.h[i].value, Frequency: t.heap.h[i].frequency})
 	}
 	return json.Marshal(topKJSON{t.k, t.errorRate, t.accuracy, sketch, heap, ""})
 }
@@ -173,9 +185,11 @@ func (t *TopK) Import(data []byte) error {
 	t.k = topk.K
 	t.accuracy = topk.Accuracy
 	t.errorRate = topk.ErrorRate
-	var heap minHeap
+	heap := &minHeap{
+		h: make([]heapElement, 0),
+	}
 	for i := range topk.Heap {
-		heap = append(heap, heapElement{value: topk.Heap[i].Value, frequency: topk.Heap[i].Frequency})
+		heap.h = append(heap.h, heapElement{value: topk.Heap[i].Value, frequency: topk.Heap[i].Frequency})
 	}
 	t.heap = heap
 	sketch, err := NewCountMinSketch(topk.Sketch.Rows, topk.Sketch.Columns)
@@ -202,8 +216,12 @@ func (t *TopK) Equals(u *TopK) (bool, error) {
 	if !t.sketch.Equals(u.sketch) {
 		return false, fmt.Errorf("sketches aren't equal")
 	}
-	for i := range t.heap {
-		if t.heap[i] != u.heap[i] {
+
+	t.heap.lk.Lock()
+	defer t.heap.lk.Unlock()
+
+	for i := range t.heap.h {
+		if t.heap.h[i] != u.heap.h[i] {
 			return false, fmt.Errorf("heaps aren't equal")
 		}
 	}
@@ -231,8 +249,11 @@ func (t *TopK) WriteTo(stream io.Writer) (int64, error) {
 		return 0, err
 	}
 	numBytesHeap := int64(0)
+
+	t.heap.lk.Lock()
+	defer t.heap.lk.Unlock()
 	for i := uint(0); i < t.k; i++ {
-		element := t.heap[i]
+		element := t.heap.h[i]
 		err := binary.Write(stream, binary.BigEndian, uint64(len(element.value)))
 		if err != nil {
 			return 0, err
@@ -274,7 +295,9 @@ func (t *TopK) ReadFrom(stream io.Reader) (int64, error) {
 		return 0, err
 	}
 	numBytesHeap := int64(0)
-	heap := &minHeap{}
+	heap := &minHeap{
+		h: make([]heapElement, 0),
+	}
 	for i := uint64(0); i < k; i++ {
 		var strLen, frequency uint64
 		err := binary.Read(stream, binary.BigEndian, &strLen)
@@ -290,12 +313,12 @@ func (t *TopK) ReadFrom(stream io.Reader) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		*heap = append(*heap, heapElement{value: string(b), frequency: frequency})
+		heap.h = append(heap.h, heapElement{value: string(b), frequency: frequency})
 	}
 	t.k = uint(k)
 	t.accuracy = accuracy
 	t.errorRate = errorRate
-	t.heap = *heap
+	t.heap = heap
 	t.sketch = sketch
 	return numBytesSketch + numBytesHeap + int64(3*binary.Size(uint64(0))), nil
 }
